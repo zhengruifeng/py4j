@@ -205,7 +205,7 @@ class JavaClient(GatewayClient):
 
     def __init__(
             self, java_parameters, python_parameters, gateway_property=None,
-            finalizer_deque=None):
+            finalizer_deque=None, python_conn_initializer=None):
         """
         :param java_parameters: collection of parameters and flags used to
             configure the JavaGateway (Java client)
@@ -226,6 +226,7 @@ class JavaClient(GatewayClient):
         self.python_parameters = python_parameters
         self.thread_connection = local()
         self.finalizer_deque = finalizer_deque
+        self.python_conn_initializer = python_conn_initializer
 
     def garbage_collect_object(self, target_id, enqueue=True):
         """Tells the Java side that there is no longer a reference to this
@@ -287,7 +288,8 @@ class JavaClient(GatewayClient):
     def _create_new_connection(self):
         connection = ClientServerConnection(
             self.java_parameters, self.python_parameters,
-            self.gateway_property, self)
+            self.gateway_property, self,
+            python_conn_initializer=self.python_conn_initializer)
         connection.connect_to_java_server()
         self.set_thread_connection(connection)
         return connection
@@ -387,7 +389,7 @@ class ClientServerConnection(object):
 
     def __init__(
             self, java_parameters, python_parameters, gateway_property,
-            java_client, python_server=None):
+            java_client, python_server=None, python_conn_initializer=None):
         """
         :param java_parameters: collection of parameters and flags used to
             configure the JavaGateway (Java client)
@@ -426,6 +428,7 @@ class ClientServerConnection(object):
         self.java_client = java_client
         self.python_server = python_server
         self.initiated_from_client = False
+        self.python_conn_initializer = python_conn_initializer
 
     def connect_to_java_server(self):
         try:
@@ -488,7 +491,14 @@ class ClientServerConnection(object):
                          exc_info=True)
 
     def start(self):
-        t = Thread(target=self.run)
+        if self.python_conn_initializer is not None:
+            try:
+                t = InheritableThread(target=self.run, initializer=self.python_conn_initializer)
+            except ValueError:
+                t = Thread(target=self.run)
+        else:
+            t = Thread(target=self.run)
+
         t.daemon = self.python_parameters.daemonize_connections
         t.start()
 
@@ -659,7 +669,7 @@ class ClientServer(JavaGateway):
 
     def __init__(
             self, java_parameters=None, python_parameters=None,
-            python_server_entry_point=None):
+            python_server_entry_point=None, python_conn_initializer=None):
         """
         :param java_parameters: collection of parameters and flags used to
             configure the JavaGateway (Java client)
@@ -676,6 +686,7 @@ class ClientServer(JavaGateway):
             python_parameters = PythonParameters()
         self.java_parameters = java_parameters
         self.python_parameters = python_parameters
+        self.python_conn_initializer = python_conn_initializer
         super(ClientServer, self).__init__(
             gateway_parameters=java_parameters,
             callback_server_parameters=python_parameters,
@@ -693,7 +704,8 @@ class ClientServer(JavaGateway):
         worker_deque = self._create_finalizer_worker()
         java_client = JavaClient(
             self.java_parameters, self.python_parameters,
-            finalizer_deque=worker_deque)
+            finalizer_deque=worker_deque,
+            python_conn_initializer=self.python_conn_initializer)
         return java_client
 
     def _create_callback_server(self, callback_server_parameters):
@@ -701,3 +713,18 @@ class ClientServer(JavaGateway):
             self._gateway_client, self.java_parameters, self.python_parameters,
             self.gateway_property)
         return callback_server
+
+
+class InheritableThread(Thread):
+
+    def __init__(self, target, initializer):
+        _inheritableThreadLocals = initializer.getInheritableThreadLocals()
+
+        def inheritable_thread_target():
+            initializer.setInheritableThreadLocals(_inheritableThreadLocals)
+            return target()
+
+        super(InheritableThread, self).__init__(target=inheritable_thread_target)
+
+    def start(self):
+        return super(InheritableThread, self).start()
